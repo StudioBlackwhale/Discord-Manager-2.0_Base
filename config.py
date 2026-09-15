@@ -1,7 +1,8 @@
 """Discord Manager 2.0 기본 설정.
 
 새 방송인용으로 사용할 때는 가급적 이 파일의 값만 수정하세요.
-main.py의 구조/권한 로직과 이름/문구를 분리해 두었습니다.
+preset.py의 구조/권한 정의와 이름/문구를 분리해 두었습니다.
+딕셔너리 키는 저장된 리소스의 식별자이므로 유지하고 표시 값만 변경하세요.
 """
 
 BOT_LOGGER_NAME = "discord_manager"
@@ -57,6 +58,3 @@ NICKNAME_SUCCESS_NO_GAME = "닉네임 {nickname} 제출이 완료되었습니다
 
 # 닉네임 안내를 찾을 때 전체 채널 기록을 무제한으로 훑지 않습니다.
 GUIDE_SCAN_LIMIT = 100
-
-# reset 시에도 유지할 역할입니다.
-PROTECTED_ROLE_KEYS = ("owner", "manager", "streamer", "viewer")

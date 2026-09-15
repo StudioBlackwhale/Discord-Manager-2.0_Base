@@ -19,6 +19,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Compile
-        run: python -m py_compile main.py config.py
+        run: python -m compileall -q main.py config.py preset.py resources.py state.py tests
       - name: Test
         run: python -m unittest discover -s tests -v

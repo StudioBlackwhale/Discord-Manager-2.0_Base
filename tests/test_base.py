@@ -4,7 +4,7 @@ import config
 import main
 
 
-class NeutralBaseTests(unittest.TestCase):
+class NeutralBaseTests(unittest.IsolatedAsyncioTestCase):
     def test_default_roles_are_neutral(self):
         self.assertEqual(
             config.ROLE_NAMES,
@@ -36,7 +36,7 @@ class NeutralBaseTests(unittest.TestCase):
         self.assertEqual(without_game, "닉네임 nickname 제출이 완료되었습니다.")
         self.assertNotIn("  ", without_game)
 
-    def test_nickname_view_is_persistent(self):
+    async def test_nickname_view_is_persistent(self):
         view = main.NicknameSubmissionView()
         self.assertIsNone(view.timeout)
         self.assertTrue(view.is_persistent())
