@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -10,6 +9,10 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 import config
+import preset
+from preset import ROLE_OWNER, ROLE_MANAGER, ROLE_VIEWER, CH_BROADCAST, CH_NICKLOG, CH_LOG, text_key
+from resources import ResourceConflict, ResourceManager
+from state import SQLiteStateStore, StateError
 
 load_dotenv()
 logging.basicConfig(
@@ -20,38 +23,6 @@ log = logging.getLogger(config.BOT_LOGGER_NAME)
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 MAX_MESSAGE = 2000
 
-ROLE_OWNER = config.ROLE_NAMES["owner"]
-ROLE_MANAGER = config.ROLE_NAMES["manager"]
-ROLE_STREAMER = config.ROLE_NAMES["streamer"]
-ROLE_VIEWER = config.ROLE_NAMES["viewer"]
-PROTECTED_ROLES = {config.ROLE_NAMES[key] for key in config.PROTECTED_ROLE_KEYS}
-
-CAT_INFO = config.CATEGORY_NAMES["info"]
-CAT_COMMUNITY = config.CATEGORY_NAMES["community"]
-CAT_COLLAB = config.CATEGORY_NAMES["collab"]
-CAT_OPS = config.CATEGORY_NAMES["ops"]
-
-CH_RULES = config.CHANNEL_NAMES["rules"]
-CH_NOTICE = config.CHANNEL_NAMES["notice"]
-CH_BROADCAST = config.CHANNEL_NAMES["broadcast"]
-CH_CHAT = config.CHANNEL_NAMES["chat"]
-CH_MEDIA = config.CHANNEL_NAMES["media"]
-CH_NICKNAME = config.CHANNEL_NAMES["nickname"]
-CH_WAITING = config.CHANNEL_NAMES["waiting"]
-CH_PART = {
-    1: config.CHANNEL_NAMES["participation_1"],
-    2: config.CHANNEL_NAMES["participation_2"],
-}
-CH_COLLAB_TEXT = config.CHANNEL_NAMES["collab_text"]
-CH_COLLAB = {
-    1: config.CHANNEL_NAMES["collab_1"],
-    2: config.CHANNEL_NAMES["collab_2"],
-}
-CH_STAFF = config.CHANNEL_NAMES["staff"]
-CH_NICKLOG = config.CHANNEL_NAMES["nickname_db"]
-CH_LOG = config.CHANNEL_NAMES["audit_log"]
-OPS_CHANNEL_ORDER = (CH_STAFF, CH_NICKLOG, CH_LOG)
-
 NICKNAME_SUBMIT_CUSTOM_ID = config.NICKNAME_SUBMIT_CUSTOM_ID
 NICKNAME_BUTTON_LABEL = config.NICKNAME_BUTTON_LABEL
 NICKNAME_GUIDE_TEXT = config.NICKNAME_GUIDE_TEXT
@@ -59,55 +30,8 @@ GUIDE_SCAN_LIMIT = config.GUIDE_SCAN_LIMIT
 GUIDE_LOOKUP_FAILED = "닉네임 안내 상태를 확인하지 못했습니다. Discord API 오류."
 
 
-@dataclass(frozen=True)
-class CategorySpec:
-    name: str
-    key: str
-
-
-@dataclass(frozen=True)
-class ChannelSpec:
-    name: str
-    category: str
-    key: str
-    is_voice: bool = False
-    topic: str = ""
-
-
-CATEGORY_SPECS = (
-    CategorySpec(CAT_INFO, "public_cat"),
-    CategorySpec(CAT_COMMUNITY, "public_cat"),
-    CategorySpec(CAT_COLLAB, "collab_cat"),
-    CategorySpec(CAT_OPS, "ops_cat"),
-)
-
-CHANNEL_SPECS = (
-    ChannelSpec(CH_RULES, CAT_INFO, "readonly"),
-    ChannelSpec(CH_NOTICE, CAT_INFO, "announcement"),
-    ChannelSpec(CH_BROADCAST, CAT_INFO, "announcement"),
-    ChannelSpec(CH_CHAT, CAT_COMMUNITY, "normal"),
-    ChannelSpec(CH_MEDIA, CAT_COMMUNITY, "normal"),
-    ChannelSpec(
-        CH_NICKNAME,
-        CAT_COMMUNITY,
-        "nickname",
-        topic=config.CHANNEL_TOPICS.get("nickname", ""),
-    ),
-    ChannelSpec(CH_WAITING, CAT_COMMUNITY, "waiting", is_voice=True),
-    ChannelSpec(CH_PART[1], CAT_COMMUNITY, "participation", is_voice=True),
-    ChannelSpec(CH_PART[2], CAT_COMMUNITY, "participation", is_voice=True),
-    ChannelSpec(CH_COLLAB_TEXT, CAT_COLLAB, "collab_text"),
-    ChannelSpec(CH_COLLAB[1], CAT_COLLAB, "collab_voice", is_voice=True),
-    ChannelSpec(CH_COLLAB[2], CAT_COLLAB, "collab_voice", is_voice=True),
-    ChannelSpec(CH_STAFF, CAT_OPS, "operations"),
-    ChannelSpec(CH_NICKLOG, CAT_OPS, "operations"),
-    ChannelSpec(CH_LOG, CAT_OPS, "operations"),
-)
-SPEC_BY_NAME = {spec.name: spec for spec in CHANNEL_SPECS}
-
-
 class DiscordManager(discord.Client):
-    def __init__(self):
+    def __init__(self, store=None):
         intents = discord.Intents.default()
         intents.members = True
         super().__init__(intents=intents)
@@ -116,6 +40,8 @@ class DiscordManager(discord.Client):
         self.setup_locks = {}
         self.command_sync_locks = {}
         self._nickname_view_registered = False
+        self.store = store or SQLiteStateStore(os.getenv("DM_STATE_PATH", "data/dm.sqlite3"))
+        self.resources = ResourceManager(self.store)
 
     async def setup_hook(self):
         if not self._nickname_view_registered:
@@ -126,37 +52,14 @@ class DiscordManager(discord.Client):
 bot = DiscordManager()
 
 
-def role(guild, name, excluded_ids=()):
-    return next(
-        (r for r in guild.roles if r.id not in excluded_ids and r.name == name),
-        None,
-    )
+def role(guild, name):
+    key = preset.ROLE_KEYS.get(name)
+    return bot.resources.cached(guild, key) if key else None
 
 
-def text_key(name):
-    # Discord 텍스트 채널은 공백을 하이픈으로 정규화할 수 있다.
-    return "-".join(name.strip().split()).casefold()
-
-
-def text(guild, name, excluded_ids=()):
-    channels = [ch for ch in guild.text_channels if ch.id not in excluded_ids]
-    exact = discord.utils.get(channels, name=name)
-    if exact:
-        return exact
-    key = text_key(name)
-    return next((ch for ch in channels if text_key(ch.name) == key), None)
-
-
-def voice(guild, name, excluded_ids=()):
-    return next(
-        (ch for ch in guild.voice_channels if ch.id not in excluded_ids and ch.name == name),
-        None,
-    )
-
-
-def find_channel(guild, spec, excluded_ids=()):
-    finder = voice if spec.is_voice else text
-    return finder(guild, spec.name, excluded_ids)
+def text(guild, name):
+    key = preset.CHANNEL_KEY_BY_NAME.get(name)
+    return bot.resources.cached(guild, key) if key else None
 
 
 async def respond(interaction, message):
@@ -211,7 +114,11 @@ async def require_setup_operator(interaction):
     if interaction.guild is not None and isinstance(interaction.user, discord.Member):
         if interaction.user.id == interaction.guild.owner_id:
             return True
-        manager = role(interaction.guild, ROLE_MANAGER)
+        try:
+            manager = role(interaction.guild, ROLE_MANAGER)
+        except StateError as error:
+            await respond(interaction, str(error))
+            return False
         if manager and manager in interaction.user.roles:
             return True
     await respond(interaction, "/setup 명령은 서버 소유자 또는 Manager만 사용할 수 있습니다.")
@@ -241,576 +148,6 @@ async def audit(interaction, message):
 
 def manageable(guild, target_role):
     return bool(guild.me and target_role < guild.me.top_role)
-
-
-# ---------------------------------------------------------------- 권한 덮어쓰기
-
-def managed_targets(guild, roles=None):
-    if roles is None:
-        roles = [role(guild, name) for name in PROTECTED_ROLES]
-    return {guild.default_role} | {r for r in roles if r is not None}
-
-
-def merge_overwrites(current, desired, managed, excluded_ids=()):
-    # 멤버 개인 예외와 사용자가 별도로 만든 역할 권한은 보존한다.
-    merged = {
-        target: overwrite
-        for target, overwrite in current.items()
-        if target not in managed and target.id not in excluded_ids
-    }
-    merged.update(desired)
-    return merged
-
-
-def managed_overwrites_differ(channel, desired, managed):
-    current = {t: o for t, o in channel.overwrites.items() if t in managed}
-    return current != desired
-
-
-def overwrite_sets(guild, streamer=None, viewer=None):
-    everyone = guild.default_role
-    streamer = streamer if streamer is not None else role(guild, ROLE_STREAMER)
-    viewer = viewer if viewer is not None else role(guild, ROLE_VIEWER)
-    OW = discord.PermissionOverwrite
-
-    def pairs(*items):
-        return {target: overwrite for target, overwrite in items if target is not None}
-
-    no_write = dict(
-        send_messages=False,
-        add_reactions=False,
-        mention_everyone=False,
-        create_public_threads=False,
-        create_private_threads=False,
-        send_messages_in_threads=False,
-    )
-    viewer_reactions = dict(
-        add_reactions=True,
-        mention_everyone=False,
-        send_messages=False,
-        create_public_threads=False,
-        create_private_threads=False,
-        send_messages_in_threads=False,
-    )
-
-    return {
-        "public_cat": pairs(
-            (everyone, OW(view_channel=True, mention_everyone=False)),
-            (viewer, OW(add_reactions=True, mention_everyone=False)),
-        ),
-        "collab_cat": pairs(
-            (everyone, OW(view_channel=False, mention_everyone=False)),
-            (streamer, OW(view_channel=True, mention_everyone=False)),
-        ),
-        "ops_cat": pairs(
-            (everyone, OW(view_channel=False, mention_everyone=False)),
-            (streamer, OW(view_channel=False, mention_everyone=False)),
-        ),
-        "readonly": pairs(
-            (everyone, OW(view_channel=True, read_message_history=True, **no_write)),
-            (viewer, OW(**viewer_reactions)),
-        ),
-        "announcement": pairs(
-            (everyone, OW(view_channel=True, read_message_history=True, **no_write)),
-            (viewer, OW(**viewer_reactions)),
-        ),
-        "normal": pairs(
-            (
-                everyone,
-                OW(
-                    view_channel=True,
-                    read_message_history=True,
-                    send_messages=True,
-                    add_reactions=True,
-                    mention_everyone=False,
-                ),
-            ),
-            (viewer, OW(add_reactions=True, mention_everyone=False)),
-        ),
-        "nickname": pairs(
-            (everyone, OW(view_channel=True, read_message_history=True, **no_write)),
-            (viewer, OW(**viewer_reactions)),
-            (streamer, OW(view_channel=True, read_message_history=True, **no_write)),
-        ),
-        "waiting": pairs(
-            (
-                everyone,
-                OW(
-                    view_channel=True,
-                    connect=True,
-                    speak=False,
-                    stream=False,
-                    send_messages=True,
-                    mention_everyone=False,
-                ),
-            ),
-            (viewer, OW(add_reactions=True, mention_everyone=False)),
-        ),
-        "participation": pairs(
-            (
-                everyone,
-                OW(
-                    view_channel=False,
-                    connect=True,
-                    speak=True,
-                    stream=False,
-                    send_messages=True,
-                    mention_everyone=False,
-                ),
-            ),
-            (
-                streamer,
-                OW(
-                    view_channel=False,
-                    connect=True,
-                    speak=True,
-                    stream=False,
-                    send_messages=True,
-                    mention_everyone=False,
-                ),
-            ),
-        ),
-        "collab_text": pairs(
-            (everyone, OW(view_channel=False, send_messages=False, mention_everyone=False)),
-            (
-                streamer,
-                OW(
-                    view_channel=True,
-                    read_message_history=True,
-                    send_messages=True,
-                    mention_everyone=False,
-                ),
-            ),
-        ),
-        "collab_voice": pairs(
-            (
-                everyone,
-                OW(
-                    view_channel=False,
-                    connect=False,
-                    speak=False,
-                    stream=False,
-                    mention_everyone=False,
-                ),
-            ),
-            (
-                streamer,
-                OW(
-                    view_channel=True,
-                    connect=True,
-                    speak=True,
-                    stream=False,
-                    send_messages=True,
-                    mention_everyone=False,
-                ),
-            ),
-        ),
-        "operations": pairs(
-            (everyone, OW(view_channel=False, send_messages=False, mention_everyone=False)),
-            (streamer, OW(view_channel=False, send_messages=False, mention_everyone=False)),
-        ),
-    }
-
-
-def expected_role_permissions():
-    return {
-        ROLE_OWNER: discord.Permissions(administrator=True),
-        ROLE_MANAGER: discord.Permissions(administrator=True),
-        ROLE_STREAMER: discord.Permissions.none(),
-        ROLE_VIEWER: discord.Permissions(add_reactions=True),
-    }
-
-
-# ---------------------------------------------------------------- 구조 생성/동기화
-
-async def ensure_role(guild, name, permissions, excluded_ids=()):
-    target = role(guild, name, excluded_ids)
-    if target is None:
-        return (
-            await guild.create_role(
-                name=name,
-                permissions=permissions,
-                reason="Discord Manager /setup",
-            ),
-            True,
-        )
-    if target.permissions != permissions:
-        if manageable(guild, target):
-            target = await target.edit(
-                permissions=permissions,
-                reason="Discord Manager /setup",
-            )
-        else:
-            log.warning("Role %s is above the bot role; permission edit skipped", name)
-    return target, False
-
-
-async def ensure_category(guild, spec, overwrites, excluded_ids=(), managed=frozenset()):
-    categories = [ch for ch in guild.categories if ch.id not in excluded_ids]
-    channel = discord.utils.get(categories, name=spec.name)
-    if channel is None:
-        return (
-            await guild.create_category(
-                spec.name,
-                overwrites=overwrites,
-                reason="Discord Manager /setup",
-            ),
-            True,
-        )
-    return (
-        await channel.edit(
-            overwrites=merge_overwrites(
-                channel.overwrites,
-                overwrites,
-                managed,
-                excluded_ids,
-            ),
-            reason="Discord Manager /setup",
-        ),
-        False,
-    )
-
-
-def topic_kwargs(spec):
-    return {"topic": spec.topic} if spec.topic and not spec.is_voice else {}
-
-
-async def ensure_channel(guild, spec, category, overwrites, excluded_ids=(), managed=frozenset()):
-    channel = find_channel(guild, spec, excluded_ids)
-    if channel is None:
-        creator = guild.create_voice_channel if spec.is_voice else guild.create_text_channel
-        return (
-            await creator(
-                spec.name,
-                category=category,
-                overwrites=overwrites,
-                reason="Discord Manager /setup",
-                **topic_kwargs(spec),
-            ),
-            True,
-        )
-    return (
-        await channel.edit(
-            category=category,
-            overwrites=merge_overwrites(
-                channel.overwrites,
-                overwrites,
-                managed,
-                excluded_ids,
-            ),
-            reason="Discord Manager /setup",
-            **topic_kwargs(spec),
-        ),
-        False,
-    )
-
-
-async def ensure_log(guild):
-    channel = text(guild, CH_LOG)
-    if channel is None:
-        channel = await guild.create_text_channel(
-            CH_LOG,
-            overwrites={
-                guild.default_role: discord.PermissionOverwrite(view_channel=False)
-            },
-            reason="Discord Manager persistent audit log",
-        )
-    if channel.category:
-        channel = await channel.edit(
-            category=None,
-            reason="Discord Manager preserve audit log",
-        )
-    return channel
-
-
-def media_is_misplaced(community, chat, media):
-    if community is None or chat is None or media is None:
-        return False
-    ordered = community.text_channels
-    if chat not in ordered or media not in ordered:
-        return False
-    return ordered.index(media) != ordered.index(chat) + 1
-
-
-def ops_order_is_wrong(ops, channels):
-    if ops is None or any(ch is None for ch in channels):
-        return False
-    ordered = ops.text_channels
-    if any(ch not in ordered for ch in channels):
-        return False
-    indexes = [ordered.index(ch) for ch in channels]
-    return indexes != list(range(indexes[0], indexes[0] + len(indexes))) or indexes[0] != 0
-
-
-async def enforce_ops_order(ops, channels):
-    managed_ids = {ch.id for ch in channels}
-    ordered = list(channels) + [ch for ch in ops.text_channels if ch.id not in managed_ids]
-    payload = [
-        {"id": channel.id, "position": position}
-        for position, channel in enumerate(ordered)
-    ]
-    # discord.py에 공개 bulk 정렬 API가 없어 REST 래퍼를 사용한다.
-    await ops._state.http.bulk_channel_update(
-        ops.guild.id,
-        payload,
-        reason="Discord Manager operations ordering",
-    )
-
-
-async def build_structure(guild, preserved_log=None, excluded_ids=()):
-    role_objects = {}
-    created = 0
-    for name, permissions in expected_role_permissions().items():
-        target, made = await ensure_role(guild, name, permissions, excluded_ids)
-        role_objects[name] = target
-        created += int(made)
-
-    if guild.default_role.permissions.mention_everyone:
-        permissions = discord.Permissions(guild.default_role.permissions.value)
-        permissions.update(mention_everyone=False)
-        await guild.default_role.edit(
-            permissions=permissions,
-            reason="Discord Manager block mass mentions for @everyone",
-        )
-
-    owner_role = role_objects[ROLE_OWNER]
-    if guild.owner and owner_role not in guild.owner.roles and manageable(guild, owner_role):
-        try:
-            await guild.owner.add_roles(owner_role, reason="Discord Manager owner role")
-        except (discord.Forbidden, discord.HTTPException):
-            log.exception("Could not assign Owner role to guild owner")
-
-    overwrites = overwrite_sets(
-        guild,
-        role_objects[ROLE_STREAMER],
-        role_objects[ROLE_VIEWER],
-    )
-    managed = managed_targets(guild, list(role_objects.values()))
-
-    categories = {}
-    for spec in CATEGORY_SPECS:
-        category, made = await ensure_category(
-            guild,
-            spec,
-            overwrites[spec.key],
-            excluded_ids,
-            managed,
-        )
-        categories[spec.name] = category
-        created += int(made)
-
-    built = {}
-    for spec in CHANNEL_SPECS:
-        if spec.name == CH_LOG and preserved_log is not None:
-            built[spec.name] = await preserved_log.edit(
-                category=categories[spec.category],
-                overwrites=merge_overwrites(
-                    preserved_log.overwrites,
-                    overwrites[spec.key],
-                    managed,
-                    excluded_ids,
-                ),
-                reason="Discord Manager restore audit log",
-            )
-            continue
-        channel, made = await ensure_channel(
-            guild,
-            spec,
-            categories[spec.category],
-            overwrites[spec.key],
-            excluded_ids,
-            managed,
-        )
-        built[spec.name] = channel
-        created += int(made)
-
-    if media_is_misplaced(
-        categories[CAT_COMMUNITY],
-        built[CH_CHAT],
-        built[CH_MEDIA],
-    ):
-        await built[CH_MEDIA].move(
-            after=built[CH_CHAT],
-            category=categories[CAT_COMMUNITY],
-            sync_permissions=False,
-            reason="Discord Manager channel ordering",
-        )
-
-    ops_channels = [built[name] for name in OPS_CHANNEL_ORDER]
-    if ops_order_is_wrong(categories[CAT_OPS], ops_channels):
-        await enforce_ops_order(categories[CAT_OPS], ops_channels)
-
-    await guild.edit(
-        system_channel=built[CH_LOG],
-        reason="Discord Manager /setup",
-    )
-    return created, built[CH_NICKNAME]
-
-
-# ---------------------------------------------------------------- 상태 점검
-
-def sync_change_counts(guild):
-    server_permissions = int(guild.default_role.permissions.mention_everyone)
-    role_permissions = 0
-    for name, permissions in expected_role_permissions().items():
-        target = role(guild, name)
-        if target and target.permissions != permissions and manageable(guild, target):
-            role_permissions += 1
-
-    channel_permissions = 0
-    overwrites = overwrite_sets(guild)
-    managed = managed_targets(guild)
-    for spec in CATEGORY_SPECS:
-        category = discord.utils.get(guild.categories, name=spec.name)
-        if category and managed_overwrites_differ(category, overwrites[spec.key], managed):
-            channel_permissions += 1
-    for spec in CHANNEL_SPECS:
-        channel = find_channel(guild, spec)
-        if channel and managed_overwrites_differ(channel, overwrites[spec.key], managed):
-            channel_permissions += 1
-    return server_permissions, role_permissions, channel_permissions
-
-
-def skipped_role_changes(guild):
-    skipped = []
-    for name, permissions in expected_role_permissions().items():
-        target = role(guild, name)
-        if target and target.permissions != permissions and not manageable(guild, target):
-            skipped.append(target.name)
-    return skipped
-
-
-async def preview(guild):
-    changes = []
-    if guild.default_role.permissions.mention_everyone:
-        changes.append("역할 `@everyone`의 @everyone/@here 멘션 권한 차단")
-
-    for name, permissions in expected_role_permissions().items():
-        target = role(guild, name)
-        if not target:
-            changes.append(f"역할 `{name}` 생성")
-        elif target.permissions != permissions:
-            suffix = " (봇 역할보다 위라 자동 수정 불가)" if not manageable(guild, target) else ""
-            changes.append(f"역할 `{name}` 권한 수정{suffix}")
-
-    for spec in CATEGORY_SPECS:
-        if not discord.utils.get(guild.categories, name=spec.name):
-            changes.append(f"분류 `{spec.name}` 생성")
-
-    for spec in CHANNEL_SPECS:
-        channel = find_channel(guild, spec)
-        if not channel:
-            changes.append(f"채널 `{spec.name}` 생성")
-            continue
-        if not channel.category or channel.category.name != spec.category:
-            changes.append(f"채널 `{spec.name}`을 `{spec.category}` 분류로 이동")
-        if spec.topic and getattr(channel, "topic", None) != spec.topic:
-            changes.append(f"채널 `{spec.name}` 안내문 설정")
-
-    overwrites = overwrite_sets(guild)
-    managed = managed_targets(guild)
-    for spec in CATEGORY_SPECS:
-        category = discord.utils.get(guild.categories, name=spec.name)
-        if category and managed_overwrites_differ(category, overwrites[spec.key], managed):
-            changes.append(f"분류 `{spec.name}` 권한 수정")
-    for spec in CHANNEL_SPECS:
-        channel = find_channel(guild, spec)
-        if channel and managed_overwrites_differ(channel, overwrites[spec.key], managed):
-            changes.append(f"채널 `{spec.name}` 권한 수정")
-
-    community = discord.utils.get(guild.categories, name=CAT_COMMUNITY)
-    if media_is_misplaced(community, text(guild, CH_CHAT), text(guild, CH_MEDIA)):
-        changes.append(f"채널 `{CH_MEDIA}`을 `{CH_CHAT}` 바로 아래로 이동")
-
-    ops = discord.utils.get(guild.categories, name=CAT_OPS)
-    ops_channels = [text(guild, name) for name in OPS_CHANNEL_ORDER]
-    if ops_order_is_wrong(ops, ops_channels):
-        changes.append(f"운영 채널 순서를 `{' → '.join(OPS_CHANNEL_ORDER)}`로 정렬")
-
-    audit_log = text(guild, CH_LOG)
-    if audit_log and guild.system_channel != audit_log:
-        changes.append(f"시스템 메시지 채널을 `{CH_LOG}`로 변경")
-
-    changes.extend(await inspect_nickname_guide(text(guild, CH_NICKNAME)))
-    return changes
-
-
-# ---------------------------------------------------------------- 초기화
-
-@dataclass
-class ResetResult:
-    deleted_channels: int = 0
-    deleted_roles: int = 0
-    skipped_roles: list = field(default_factory=list)
-    failed_channels: list = field(default_factory=list)
-    excluded_ids: set = field(default_factory=set)
-
-
-def brief_names(names):
-    body = ", ".join(names[:5])
-    return body + (f" 외 {len(names) - 5}개" if len(names) > 5 else "")
-
-
-async def wipe_server(guild, command_channel, management_log):
-    result = ResetResult()
-    preserve = {command_channel.id, management_log.id}
-
-    if command_channel.id != management_log.id:
-        await command_channel.edit(
-            name=f"discord-manager-reset-temp-{command_channel.id}",
-            category=None,
-            reason="Discord Manager reset temp",
-        )
-        result.excluded_ids.add(command_channel.id)
-
-    if management_log.category:
-        await management_log.edit(
-            category=None,
-            reason="Discord Manager preserve audit log",
-        )
-
-    for channel in list(guild.channels):
-        if channel.id in preserve or isinstance(channel, discord.CategoryChannel):
-            continue
-        try:
-            await channel.delete(reason="Discord Manager owner-confirmed reset")
-            result.deleted_channels += 1
-            result.excluded_ids.add(channel.id)
-        except discord.NotFound:
-            result.excluded_ids.add(channel.id)
-        except discord.HTTPException:
-            result.failed_channels.append(channel.name)
-            log.exception("Reset could not delete channel %s (%s)", channel.name, channel.id)
-
-    for category in list(guild.categories):
-        try:
-            await category.delete(reason="Discord Manager owner-confirmed reset")
-            result.deleted_channels += 1
-            result.excluded_ids.add(category.id)
-        except discord.NotFound:
-            result.excluded_ids.add(category.id)
-        except discord.HTTPException:
-            result.failed_channels.append(category.name)
-            log.exception("Reset could not delete category %s (%s)", category.name, category.id)
-
-    top_role = guild.me.top_role if guild.me else None
-    for target in sorted(guild.roles, key=lambda r: r.position, reverse=True):
-        if target.is_default() or target.managed or target.name in PROTECTED_ROLES:
-            continue
-        if top_role and target >= top_role:
-            result.skipped_roles.append(target.name)
-            continue
-        try:
-            await target.delete(reason="Discord Manager owner-confirmed reset")
-            result.deleted_roles += 1
-            result.excluded_ids.add(target.id)
-        except discord.NotFound:
-            result.excluded_ids.add(target.id)
-        except discord.HTTPException:
-            result.skipped_roles.append(target.name)
-            log.exception("Reset could not delete role %s (%s)", target.name, target.id)
-
-    return result
 
 
 # ---------------------------------------------------------------- 닉네임 비공개 제출
@@ -968,8 +305,21 @@ async def pinned_messages(channel):
     return list(await pins)
 
 
-async def find_nickname_guide(channel):
+async def find_nickname_guide(channel, record=None):
     bot_id = channel.guild.me.id
+    if record is not None:
+        if record.channel_id != channel.id:
+            # A recreated channel cannot contain the old guide.
+            record = None
+        else:
+            try:
+                message = await channel.fetch_message(record.id)
+            except discord.NotFound:
+                pass
+            else:
+                if message.author.id != bot_id:
+                    raise ResourceConflict("기록된 안내 메시지의 작성자가 다릅니다.")
+                return message, message.pinned
     for message in await pinned_messages(channel):
         if is_guide_candidate(message, bot_id):
             return message, True
@@ -979,18 +329,18 @@ async def find_nickname_guide(channel):
     return None, False
 
 
-async def nickname_guide_problems(channel):
-    message, pinned = await find_nickname_guide(channel)
+async def nickname_guide_problems(channel, record=None):
+    message, pinned = await find_nickname_guide(channel, record)
     if message is None:
         return ["안내 메시지 없음"]
     return guide_problems(message, pinned=pinned)
 
 
-async def inspect_nickname_guide(channel):
+async def inspect_nickname_guide(channel, record=None):
     if channel is None:
         return []
     try:
-        problems = await nickname_guide_problems(channel)
+        problems = await nickname_guide_problems(channel, record)
     except discord.HTTPException:
         log.exception(
             "Nickname guide lookup failed in guild %s",
@@ -1000,8 +350,8 @@ async def inspect_nickname_guide(channel):
     return [f"닉네임 안내 메시지 정리 ({', '.join(problems)})"] if problems else []
 
 
-async def ensure_nickname_guide(channel):
-    message, pinned = await find_nickname_guide(channel)
+async def ensure_nickname_guide(channel, record, remember):
+    message, pinned = await find_nickname_guide(channel, record)
     if message is None:
         message = await channel.send(
             NICKNAME_GUIDE_TEXT,
@@ -1014,156 +364,187 @@ async def ensure_nickname_guide(channel):
             view=NicknameSubmissionView(),
             allowed_mentions=discord.AllowedMentions.none(),
         )
-    elif pinned:
-        return message
-
+    # Save the ID before pinning: a failed pin must not duplicate the message.
+    if record is None or record.id != message.id or record.channel_id != channel.id:
+        remember(message)
     if not pinned:
         await message.pin(reason="Discord Manager nickname guide")
     return message
 
 
-async def apply_nickname_guide(channel):
-    if channel is None:
-        log.warning("Nickname channel unavailable; skipped guide update")
-        return ""
-    try:
-        await ensure_nickname_guide(channel)
-    except discord.HTTPException:
-        log.exception(
-            "Nickname guide update failed in guild %s",
-            getattr(getattr(channel, "guild", None), "id", None),
-        )
-        return " 다만 닉네임 안내 메시지 생성/갱신에 실패했습니다. `/setup check`로 상태를 확인해 주세요."
-    return ""
-
-
-# ---------------------------------------------------------------- 명령
+# ---------------------------------------------------------------- setup 명령
 
 setup_group = app_commands.Group(
-    name="setup",
-    description="방송 서버 구조 확인·적용·초기화",
+    name="setup", description="방송 서버 설치·확인·복구·초기화", guild_only=True,
 )
 
 
-@setup_group.command(name="check", description="변경 예정 항목만 확인합니다.")
+async def setup_error(interaction, error):
+    log.error("Setup failed in guild %s: %s", getattr(interaction.guild, "id", None), error)
+    await respond(interaction, f"작업을 완료하지 못했습니다.\n{error}\n`/setup check`로 상태를 확인해 주세요.")
+
+
+async def send_listing(interaction, title, lines, *, view=None):
+    # Every deletion target is shown, never silently truncated to the first 25.
+    chunks, current = [], title
+    for line in lines:
+        line = f"• {line}"
+        if len(current) + len(line) + 1 > 1800:
+            chunks.append(current)
+            current = ""
+        current += "\n" + line
+    chunks.append(current)
+    for index, chunk in enumerate(chunks):
+        await interaction.followup.send(
+            chunk, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+            **({"view": view} if view is not None and index == len(chunks) - 1 else {}),
+        )
+
+
+class SetupConfirmation(discord.ui.View):
+    """Short-lived confirmation boundary, replaceable by a future setup wizard."""
+    def __init__(self, interaction, action, *, plan=None, revision=None):
+        super().__init__(timeout=120)
+        self.guild_id = interaction.guild.id
+        self.user_id = interaction.user.id
+        self.action = action
+        self.plan = plan
+        self.revision = revision
+        self.used = False
+        apply = discord.ui.Button(
+            label="설치 적용" if action == "start" else "목록의 DM 리소스 삭제",
+            style=discord.ButtonStyle.primary if action == "start" else discord.ButtonStyle.danger,
+        )
+        apply.callback = self.confirm
+        cancel = discord.ui.Button(label="취소", style=discord.ButtonStyle.secondary)
+        cancel.callback = self.cancel
+        self.add_item(apply)
+        self.add_item(cancel)
+
+    async def interaction_check(self, interaction):
+        if (interaction.guild is None or interaction.guild.id != self.guild_id
+                or interaction.user.id != self.user_id):
+            await respond(interaction, "이 확인 버튼은 명령을 실행한 사용자만 누를 수 있습니다.")
+            return False
+        return await require_setup_operator(interaction)
+
+    async def confirm(self, interaction):
+        # Recheck here as well so the security boundary is explicit and testable.
+        if not await self.interaction_check(interaction):
+            return
+        if self.used or self.is_finished():
+            return await respond(interaction, "이미 처리했거나 만료된 확인입니다. 명령을 다시 실행해 주세요.")
+        if not interaction.guild.me or not interaction.guild.me.guild_permissions.administrator:
+            return await respond(interaction, "봇에 Administrator 권한이 필요합니다.")
+        async with setup_operation(interaction) as acquired:
+            if not acquired:
+                return
+            self.used = True
+            self.stop()
+            try:
+                if self.action == "start":
+                    if bot.store.load(self.guild_id).revision != self.revision:
+                        raise ResourceConflict("설치 상태가 변경되었습니다. `/setup start`로 다시 확인해 주세요.")
+                    created = await bot.resources.sync(interaction.guild, ensure_nickname_guide)
+                    await respond(interaction, f"설치 적용 완료. 새 리소스 {created}개를 만들었습니다.")
+                    await audit(interaction, "DM Base 설치 적용")
+                else:
+                    deleted, preserved = await bot.resources.reset(interaction.guild, self.plan)
+                    await send_listing(interaction, f"DM 리소스 초기화 처리 {deleted}개. 재설치는 `/setup start`를 사용하세요.",
+                                       ["보존/미완료: " + item for item in preserved])
+            except (discord.HTTPException, ResourceConflict, StateError) as error:
+                await setup_error(interaction, error)
+
+    async def cancel(self, interaction):
+        if not await self.interaction_check(interaction):
+            return
+        if self.used:
+            return await respond(interaction, "이미 처리된 확인입니다.")
+        self.used = True
+        self.stop()
+        await interaction.response.edit_message(content="취소했습니다. 서버를 변경하지 않았습니다.", view=None)
+
+
+@setup_group.command(name="start", description="설치 내용을 확인한 뒤 DM Base를 구축합니다.")
+async def setup_start(interaction):
+    if not await require_setup_operator(interaction):
+        return
+    async with setup_operation(interaction) as acquired:
+        if not acquired:
+            return
+        try:
+            state = bot.store.load(interaction.guild.id)
+            issues = await bot.resources.check(interaction.guild, inspect_nickname_guide)
+            if state.installed and not issues:
+                return await respond(interaction, "DM Base가 이미 정상 설치되어 있습니다. 추가로 만들지 않았습니다.")
+            view = SetupConfirmation(interaction, "start", revision=state.revision)
+            await send_listing(
+                interaction,
+                "DM Base 설치 확인 — 아직 서버를 변경하지 않았습니다.\n"
+                "Owner/Manager에는 Administrator 권한을 부여하며 시스템 메시지를 관리기록에 연결합니다.\n"
+                "DM 리소스만 생성·복구하고 동명 사용자 리소스가 있으면 중단합니다. 2분 안에 적용 여부를 선택해 주세요.",
+                issues, view=view,
+            )
+        except (discord.HTTPException, ResourceConflict, StateError) as error:
+            await setup_error(interaction, error)
+
+
+@setup_group.command(name="check", description="설치·리소스·권한·안내 상태를 읽기 전용으로 진단합니다.")
 async def setup_check(interaction):
     if not await require_setup_operator(interaction):
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    changes = await preview(interaction.guild)
-    if not changes:
-        return await respond(interaction, "현재 서버 구조가 설계와 일치합니다.")
-    shown = changes[:25]
-    body = "\n".join(f"• {item}" for item in shown)
-    if len(changes) > 25:
-        body += f"\n• 외 {len(changes) - 25}개"
-    await respond(
-        interaction,
-        f"현재 설계와 다른 항목은 {len(changes)}개입니다. 아직 아무것도 수정하지 않았습니다.\n\n{body}",
-    )
+    async with setup_operation(interaction) as acquired:
+        if not acquired:
+            return
+        try:
+            issues = await bot.resources.check(interaction.guild, inspect_nickname_guide)
+            await send_listing(interaction, f"진단 결과 {len(issues)}건. 서버를 변경하지 않았습니다." if issues
+                               else "현재 서버 구조가 설계와 일치합니다.", issues)
+        except (discord.HTTPException, ResourceConflict, StateError) as error:
+            await setup_error(interaction, error)
 
 
-@setup_group.command(name="sync", description="기존 구조를 유지하면서 현재 설계를 적용합니다.")
+@setup_group.command(name="sync", description="DM이 관리하는 리소스만 생성하거나 복구합니다.")
 async def setup_sync(interaction):
     if not await require_setup_operator(interaction):
         return
-    guild = interaction.guild
-    if not guild.me or not guild.me.guild_permissions.administrator:
+    if not interaction.guild.me or not interaction.guild.me.guild_permissions.administrator:
         return await respond(interaction, "봇에 Administrator 권한이 필요합니다.")
-
     async with setup_operation(interaction) as acquired:
         if not acquired:
             return
         try:
-            server_perm, role_perm, channel_perm = sync_change_counts(guild)
-            skipped = skipped_role_changes(guild)
-            created, nickname_channel = await build_structure(guild)
-            guide_warning = await apply_nickname_guide(nickname_channel)
-            extra = ""
-            if skipped:
-                extra += f" 봇 역할 계층 때문에 적용하지 못한 역할: {brief_names(skipped)}."
-            extra += guide_warning
-            await respond(
-                interaction,
-                "서버 구성을 적용했습니다. "
-                f"새로 만든 항목 {created}개, 서버 기본 권한 수정 {server_perm}건, "
-                f"역할 권한 수정 {role_perm}건, 채널/분류 권한 수정 {channel_perm}건입니다. "
-                f"멤버 개인 예외와 추가 역할 권한은 그대로 두었습니다.{extra}",
-            )
-            await audit(interaction, "서버 역할·채널·권한 sync" + extra)
-        except discord.Forbidden as error:
-            log.exception("sync forbidden")
-            await respond(interaction, f"설정 도중 Discord가 권한을 거부했습니다. 오류: {error}")
-        except discord.HTTPException as error:
-            log.exception("sync failed")
-            await respond(interaction, f"Discord API 오류: {error}")
+            state = bot.store.load(interaction.guild.id)
+            if not state.installed and not state.resources:
+                return await respond(interaction, "최초 설치는 `/setup start`에서 확인 후 진행해 주세요.")
+            created = await bot.resources.sync(interaction.guild, ensure_nickname_guide)
+            await respond(interaction, f"DM 리소스를 복구했습니다. 새 리소스 {created}개. 사용자 리소스와 개인 권한 예외는 보존했습니다.")
+            await audit(interaction, "DM 리소스 sync")
+        except (discord.HTTPException, ResourceConflict, StateError) as error:
+            await setup_error(interaction, error)
 
 
-@setup_group.command(name="reset", description="서버를 완전 초기화한 뒤 재구성합니다.")
-@app_commands.describe(confirm="완전 초기화를 실행하려면 RESET을 입력하세요.")
-async def setup_reset(interaction, confirm: str):
+@setup_group.command(name="reset", description="삭제할 DM 리소스 목록을 확인한 뒤 초기화합니다.")
+async def setup_reset(interaction):
     if not await require_setup_operator(interaction):
         return
-    guild = interaction.guild
-    if confirm != "RESET":
-        return await respond(
-            interaction,
-            "완전 초기화를 계속하려면 confirm에 정확히 RESET을 입력하세요.",
-        )
-    if not guild.me or not guild.me.guild_permissions.administrator:
-        return await respond(interaction, "봇에 Administrator 권한이 필요합니다.")
-    if not isinstance(interaction.channel, discord.TextChannel):
-        return await respond(interaction, "완전 초기화는 일반 텍스트 채널에서 실행해 주세요.")
-
     async with setup_operation(interaction) as acquired:
         if not acquired:
             return
-        command_channel = interaction.channel
         try:
-            skipped_permissions = skipped_role_changes(guild)
-            log_channel = await ensure_log(guild)
-            result = await wipe_server(guild, command_channel, log_channel)
-            created, nickname_channel = await build_structure(
-                guild,
-                log_channel,
-                result.excluded_ids,
-            )
-            guide_warning = await apply_nickname_guide(nickname_channel)
-            extra = ""
-            if result.failed_channels:
-                extra += f" 삭제하지 못한 채널/분류: {brief_names(result.failed_channels)}."
-            if result.skipped_roles:
-                extra += f" 삭제하지 못한 역할: {brief_names(result.skipped_roles)}."
-            if skipped_permissions:
-                extra += f" 권한을 적용하지 못한 역할: {brief_names(skipped_permissions)}."
-            status = "초기화 일부 미완료." if extra else "완전 초기화 완료."
-            extra += guide_warning
-            await respond(
+            plan = await bot.resources.reset_plan(interaction.guild)
+            if not plan.targets:
+                return await send_listing(interaction, "삭제할 것으로 확인된 DM 리소스가 없습니다.", plan.preserved)
+            await send_listing(
                 interaction,
-                f"{status} `{CH_LOG}`과 {', '.join(PROTECTED_ROLES)} 역할 및 기존 멤버 배정은 보존했습니다. "
-                f"기존 채널/카테고리 {result.deleted_channels}개와 기타 역할 {result.deleted_roles}개를 삭제했고 "
-                f"새 구조 항목 {created}개를 만들었습니다.{extra}",
+                "DM 리소스 삭제 확인 — 아직 삭제하지 않았습니다.\n"
+                "아래 채널의 메시지 기록(닉네임_DB·관리기록 포함)과 삭제되는 역할의 멤버 배정도 사라집니다.\n"
+                "재구축은 자동 실행하지 않습니다. 2분 안에 확인하거나 취소해 주세요.",
+                ["삭제: " + name for _, _, name in plan.targets] + ["보존: " + item for item in plan.preserved],
+                view=SetupConfirmation(interaction, "reset", plan=plan),
             )
-            await audit(interaction, status + " 서버 초기화 및 재구성" + extra)
-
-            if command_channel.id != log_channel.id:
-                await asyncio.sleep(5)
-                try:
-                    await command_channel.delete(reason="Discord Manager temp cleanup")
-                except discord.NotFound:
-                    pass
-                except discord.HTTPException:
-                    log.exception("Could not delete reset temporary channel")
-                    await respond(
-                        interaction,
-                        f"임시 채널 {command_channel.mention} 삭제에 실패했습니다. 직접 정리해 주세요.",
-                    )
-        except discord.Forbidden as error:
-            log.exception("reset forbidden")
-            await respond(interaction, f"재구성 도중 Discord가 권한을 거부했습니다. 오류: {error}")
-        except discord.HTTPException as error:
-            log.exception("reset failed")
-            await respond(interaction, f"Discord API 오류: {error}")
+        except (discord.HTTPException, ResourceConflict, StateError) as error:
+            await setup_error(interaction, error)
 
 
 @bot.tree.command(name="방송공지", description="방송공지 채널에 공지를 보냅니다.")
@@ -1294,8 +675,10 @@ async def on_guild_join(guild):
 @bot.event
 async def on_guild_remove(guild):
     bot.synced_guilds.discard(guild.id)
-    bot.setup_locks.pop(guild.id, None)
-    bot.command_sync_locks.pop(guild.id, None)
+    for locks in (bot.setup_locks, bot.command_sync_locks):
+        lock = locks.get(guild.id)
+        if lock is not None and not lock.locked():
+            locks.pop(guild.id, None)
 
 
 @bot.event
